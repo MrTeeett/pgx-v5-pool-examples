@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	_ "github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -28,6 +28,9 @@ const (
 	psEnsureAccount    = "ps_ensure_account"
 	psGetBalance       = "ps_get_balance"
 	psSelectUsersLight = "ps_select_users_light"
+	// Для демонстрации типов и NULL-обработки на отдельной таблице
+	psInsertTypeSample = "ps_insert_type_sample"
+	psGetTypeSample    = "ps_get_type_sample"
 )
 
 // bootstrapEnsureSchema подключается напрямую (без пула) и создаёт таблицы.
@@ -46,17 +49,29 @@ func BootstrapEnsureSchema(ctx context.Context, dsn string) error {
 
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS app_users (
-            id          BIGSERIAL PRIMARY KEY,
-            email       TEXT UNIQUE NOT NULL,
-            name        TEXT NOT NULL,
-            middle_name TEXT,
-            last_login  TIMESTAMPTZ,
-            is_active   BOOLEAN NOT NULL DEFAULT TRUE
-        )`,
+			id          BIGSERIAL PRIMARY KEY,
+			email       TEXT UNIQUE NOT NULL,
+			name        TEXT NOT NULL,
+			middle_name TEXT,
+			last_login  TIMESTAMPTZ,
+			is_active   BOOLEAN NOT NULL DEFAULT TRUE
+		)`,
 		`CREATE TABLE IF NOT EXISTS accounts (
-            user_id BIGINT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
-            balance NUMERIC(12,2) NOT NULL
-        )`,
+			user_id BIGINT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
+			balance NUMERIC(12,2) NOT NULL
+		)`,
+		// Отдельная таблица для демонстрации работы с типами и NULL (pgtype.*)
+		`CREATE TABLE IF NOT EXISTS type_samples (
+			id   BIGSERIAL PRIMARY KEY,
+			uid  UUID,
+			i2   SMALLINT,
+			i4   INTEGER,
+			i8   BIGINT,
+			flag BOOLEAN,
+			note TEXT,
+			num  NUMERIC(12,2),
+			ts   TIMESTAMPTZ
+		)`,
 	}
 	for _, q := range ddl {
 		if _, err := conn.Exec(ctx, q); err != nil {
@@ -95,9 +110,9 @@ func BuildPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		// Благодаря AfterConnect мы гарантируем, что каждое соединение пула его имеет.
 		if _, err := conn.Prepare(ctx, psInsertUser,
 			`INSERT INTO app_users(email, name, middle_name)
-             VALUES ($1,$2,$3)
-             ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
-             RETURNING id`); err != nil {
+			 VALUES ($1,$2,$3)
+			 ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+			 RETURNING id`); err != nil {
 			return err
 		}
 		if _, err := conn.Prepare(ctx, psSetLastLogin,
@@ -112,8 +127,8 @@ func BuildPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		}
 		if _, err := conn.Prepare(ctx, psEnsureAccount,
 			`INSERT INTO accounts(user_id, balance)
-             VALUES ($1, 0)
-             ON CONFLICT (user_id) DO NOTHING`); err != nil {
+			 VALUES ($1, 0)
+			 ON CONFLICT (user_id) DO NOTHING`); err != nil {
 			return err
 		}
 		if _, err := conn.Prepare(ctx, psGetBalance,
@@ -126,6 +141,19 @@ func BuildPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		}
 		if _, err := conn.Prepare(ctx, psGetUserIdByEmail,
 			`SELECT id FROM app_users WHERE email = $1`); err != nil {
+			return err
+		}
+		// Prepared для вставки/чтения из таблицы демонстрации типов (type_samples)
+		if _, err := conn.Prepare(ctx, psInsertTypeSample,
+			`INSERT INTO type_samples(uid, i2, i4, i8, flag, note, num, ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			 RETURNING id`); err != nil {
+			return err
+		}
+		if _, err := conn.Prepare(ctx, psGetTypeSample,
+			`SELECT uid, i2, i4, i8, flag, note, num, ts
+			   FROM type_samples
+			  WHERE id = $1`); err != nil {
 			return err
 		}
 		return nil
@@ -155,7 +183,6 @@ func BuildPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 }
 
 // ensureSchema — создаем минимальную схему для примеров.
-// В реальном проекте это переносится в миграции.
 func EnsureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS app_users (
@@ -169,6 +196,18 @@ func EnsureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE TABLE IF NOT EXISTS accounts (
 			user_id BIGINT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
 			balance NUMERIC(12,2) NOT NULL
+		)`,
+		// Таблица под демонстрацию типов и NULL — аналогично bootstrap
+		`CREATE TABLE IF NOT EXISTS type_samples (
+			id   BIGSERIAL PRIMARY KEY,
+			uid  UUID,
+			i2   SMALLINT,
+			i4   INTEGER,
+			i8   BIGINT,
+			flag BOOLEAN,
+			note TEXT,
+			num  NUMERIC(12,2),
+			ts   TIMESTAMPTZ
 		)`,
 	}
 	for _, q := range ddl {
@@ -330,3 +369,117 @@ func ShowQueryMetadata(ctx context.Context, pool *pgxpool.Pool) error {
 //
 // Примечание: прямого поля ShouldPing в конфиге нет — это внутренняя логика пула.
 // Мы демонстрируем эффекты через HealthCheckPeriod + Ping.
+
+// TypeSample — компактная модель строки из таблицы type_samples.
+// ВАЖНО: каждый тип реализован через pgtype.* с флагом Valid: если Valid=false → в БД пишется/читается NULL.
+type TypeSample struct {
+	UUID pgtype.UUID
+	I2   pgtype.Int2
+	I4   pgtype.Int4
+	I8   pgtype.Int8
+	Flag pgtype.Bool
+	Note pgtype.Text
+	Num  pgtype.Numeric
+	TS   pgtype.Timestamp
+}
+
+// InsertTypeSample — демонстрация записи значений разных типов (включая NULL через Valid=false).
+// Используем заранее подготовленный стейтмент psInsertTypeSample (см. AfterConnect).
+func InsertTypeSample(ctx context.Context, pool *pgxpool.Pool, s TypeSample) (int64, error) {
+	var id int64
+	// Пишем строго через pgtype.* — они корректно кодируют NULL/значения и точность Numeric.
+	if err := pool.QueryRow(ctx, psInsertTypeSample,
+		s.UUID, s.I2, s.I4, s.I8, s.Flag, s.Note, s.Num, s.TS,
+	).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// GetTypeSample — чтение той же строки и демонстрация проверки Valid для каждого поля.
+func GetTypeSample(ctx context.Context, pool *pgxpool.Pool, id int64) (TypeSample, error) {
+	var out TypeSample
+	if err := pool.QueryRow(ctx, psGetTypeSample, id).
+		Scan(&out.UUID, &out.I2, &out.I4, &out.I8, &out.Flag, &out.Note, &out.Num, &out.TS); err != nil {
+		return TypeSample{}, err
+	}
+	return out, nil
+}
+
+// TxQueryExample — пример выборки внутри транзакции через tx.Query (итерация по Rows).
+// Показываем правильное закрытие курсора, rows.Err() и фиксацию транзакции.
+func TxQueryExample(ctx context.Context, pool *pgxpool.Pool) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, psSelectUsersLight)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var email, name string
+		if err := rows.Scan(&id, &email, &name); err != nil {
+			return err
+		}
+		log.Printf("tx.query row: id=%d email=%s name=%s", id, email, name)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ShowPreparedStatementMetadata — демонстрация получения метаданных prepared‑выражения без выполнения запроса.
+// Используем именованное выражение "" (unnamed) через conn.Prepare: возвращается StatementDescription
+// с параметрами (ParamOIDs) и описанием полей результата (Fields).
+func ShowPreparedStatementMetadata(ctx context.Context, pool *pgxpool.Pool) error {
+	c, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Release()
+
+	// unnamed prepared — не засоряет сервер постоянными именами; каждый Prepare перезапишет предыдущее unnamed
+	sd, err := c.Conn().Prepare(ctx, "",
+		`SELECT id, email FROM app_users WHERE email = $1`)
+	if err != nil {
+		return err
+	}
+
+	// Выведем OID типов параметров и имена/типы полей результата
+	var names []string
+	for _, f := range sd.Fields {
+		names = append(names, string(f.Name))
+	}
+	log.Printf("Prepared meta: paramOIDs=%v, resultColumns=[%s]",
+		sd.ParamOIDs, strings.Join(names, ", "))
+	return nil
+}
+
+// DemoPgErrorHandling — пример идиоматичной обработки ошибок Postgres через *pgconn.PgError.
+// Создадим уникальное нарушение (23505) на app_users.email с помощью явного INSERT без ON CONFLICT.
+func DemoPgErrorHandling(ctx context.Context, pool *pgxpool.Pool, email string) error {
+	// Нарочно пытаемся вставить уже существующий email, чтобы поймать 23505 unique_violation
+	_, err := pool.Exec(ctx,
+		`INSERT INTO app_users(email, name) VALUES ($1, 'Dupe')`, email)
+	if err == nil {
+		// Если вдруг уникального ещё не было — это не демонстрация ошибки, но и не критично.
+		log.Printf("PgError demo: уникального нарушения не случилось (email=%s)", email)
+		return nil
+	}
+	var pge *pgconn.PgError
+	if errors.As(err, &pge) {
+		// Код и краткая диагностика от сервера — полезно для ветвления логики и алертов.
+		log.Printf("PgError caught: code=%s (%s) message=%s detail=%s constraint=%s",
+			pge.Code, pge.Severity, pge.Message, pge.Detail, pge.ConstraintName)
+		return nil
+	}
+	// Если это не PgError — пробрасываем дальше.
+	return err
+}
